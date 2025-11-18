@@ -916,6 +916,50 @@ private:
 
     static constexpr std::uint8_t initial_shifts = 64 - 2; // 2^(64-m_shift) number of buckets
     static constexpr float default_max_load_factor = 0.8F;
+    
+    template <typename Data>
+    class offset_span {
+        class offset_ptr {
+            int64_t m_offset;
+        public:
+            explicit offset_ptr(int64_t offset)
+                : m_offset{offset}
+            {}
+            auto get() -> Data* { 
+                return reinterpret_cast<Data*>(reinterpret_cast<char*>(this) + m_offset);
+            }
+        };
+        offset_ptr m_ptr;
+        uint64_t m_size;
+
+    public:
+        using value_type = Data;
+        using iterator = Data*;
+        using const_iterator = const Data*;
+        using allocator_type = std::allocator<Data>;
+        using size_type = uint64_t;
+        using difference_type = std::ptrdiff_t;
+        using reference = Data&;
+        using const_reference = const Data&;
+        using pointer = Data*;
+        using const_pointer = const Data*;
+        
+        offset_span(int64_t offset, uint64_t size)
+            : m_ptr{offset}
+            , m_size{size}
+        {}
+
+        auto begin() -> iterator { return m_ptr.get(); }
+        auto end() -> iterator { return m_ptr.get() + m_size; }
+        auto operator[](uint64_t index) -> Data& { return *(begin() + index); }
+        [[nodiscard]] auto empty() const -> bool { return size() == 0; }
+        [[nodiscard]] auto size() const -> uint64_t { return m_size; }
+    };
+     
+    static constexpr auto align_up(int64_t pointer, uint64_t mask) -> int64_t {
+        pointer += (-pointer) & mask;
+        return pointer;
+    }
 
 public:
     using key_type = Key;
@@ -932,6 +976,20 @@ public:
     using const_iterator = typename value_container_type::const_iterator;
     using iterator = std::conditional_t<is_map_v<T>, typename value_container_type::iterator, const_iterator>;
     using bucket_type = Bucket;
+    using serialized_type = std::conditional_t<IsSegmented, void, table<
+        Key,
+        T,
+        Hash,
+        KeyEqual,
+        offset_span<underlying_value_type>,
+        Bucket, 
+        offset_span<Bucket>,
+        false
+    >>;
+    template <  class Key2, class T2, class Hash2, class Eq2,
+                class Alloc2, class Bucket2, class BA2,
+                bool Vis2>
+    friend class table;
 
 private:
     using value_idx_type = decltype(Bucket::m_value_idx);
@@ -939,7 +997,7 @@ private:
 
     static_assert(std::is_trivially_destructible_v<Bucket>, "assert there's no need to call destructor / std::destroy");
     static_assert(std::is_trivially_copyable_v<Bucket>, "assert we can just memset / memcpy");
-
+    
     value_container_type m_values{}; // Contains all the key-value pairs in one densely stored container. No holes.
     bucket_container_type m_buckets{};
     std::size_t m_max_bucket_capacity = 0;
@@ -1383,6 +1441,41 @@ public:
         : table(init, bucket_count, hash, KeyEqual(), alloc) {}
 
     ~table() = default;
+
+    auto dump(std::invocable<const char*, uint64_t, uint64_t> auto write, int64_t index) -> uint64_t const {
+        static_assert(!IsSegmented, "segmented layouts cannot be serialized");
+        alignas(alignof(serialized_type)) std::array<std::byte, sizeof(serialized_type)> buf;
+        auto* ptr = reinterpret_cast<serialized_type*>(&buf);
+        ptr->m_shifts = this->m_shifts;
+        ptr->m_equal = this->m_equal;
+        ptr->m_hash = this->m_hash;
+        ptr->m_max_load_factor = this->m_max_load_factor;
+        auto object_start = align_up(index, alignof(serialized_type) - 1);
+        auto object_end = object_start + (int64_t)sizeof(serialized_type);
+        auto arr1start = align_up(object_end, alignof(underlying_value_type) - 1);
+        ptr->m_values = offset_span<underlying_value_type>{arr1start - (object_start + offsetof(serialized_type, m_values)), this->m_values.size()};
+        auto arr1end = arr1start + (sizeof(underlying_value_type) * this->m_values.size());
+        auto arr2start = align_up(arr1end, alignof(Bucket) - 1);
+        ptr->m_buckets = offset_span<Bucket>{arr2start - (object_start + offsetof(serialized_type, m_buckets)), this->m_buckets.size()};
+       
+        uint64_t rem_data = (object_start - index) + sizeof(serialized_type) + (arr1start - object_end) + this->m_values.size() * sizeof(underlying_value_type) + (arr2start - arr1end) + this->m_buckets.size() * sizeof(Bucket);
+        uint64_t written = rem_data;
+        write(nullptr, object_start - index, rem_data);
+        rem_data -= object_start - index;
+        write(reinterpret_cast<char*>(&buf[0]), sizeof(serialized_type), rem_data);
+        rem_data -= sizeof(serialized_type);
+        write(nullptr, arr1start - object_end, rem_data);
+        rem_data -= arr1start - object_end;
+        auto siz = this->m_values.size() * sizeof(underlying_value_type);
+        write(reinterpret_cast<char*>(this->m_values.data()), siz, rem_data);
+        rem_data -= siz;
+        write(nullptr, arr2start - arr1end, rem_data);
+        rem_data -= arr2start - arr1end;
+        siz = this->m_buckets.size() * sizeof(Bucket);
+        write(reinterpret_cast<char*>(this->m_buckets.data()), siz, rem_data);
+        rem_data -= siz;
+        return written;    
+    }
 
     auto operator=(table const& other) -> table& {
         if (&other != this) {
