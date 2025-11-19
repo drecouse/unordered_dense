@@ -1442,7 +1442,12 @@ public:
 
     ~table() = default;
 
-    auto dump(std::invocable<const char*, uint64_t, uint64_t> auto write, int64_t index) -> uint64_t const {
+    auto access_comparator_unsafe(int64_t& offset) -> KeyEqual& {
+        offset = offsetof(serialized_type, m_equal);
+        return this->m_equal;
+    }
+
+    auto dump(std::invocable<const char*, uint64_t, uint64_t> auto write, int64_t index) const -> uint64_t {
         static_assert(!IsSegmented, "segmented layouts cannot be serialized");
         alignas(alignof(serialized_type)) std::array<std::byte, sizeof(serialized_type)> buf;
         auto* ptr = reinterpret_cast<serialized_type*>(&buf);
@@ -1458,21 +1463,21 @@ public:
         auto arr2start = align_up(arr1end, alignof(Bucket) - 1);
         ptr->m_buckets = offset_span<Bucket>{arr2start - (object_start + offsetof(serialized_type, m_buckets)), this->m_buckets.size()};
        
-        uint64_t rem_data = (object_start - index) + sizeof(serialized_type) + (arr1start - object_end) + this->m_values.size() * sizeof(underlying_value_type) + (arr2start - arr1end) + this->m_buckets.size() * sizeof(Bucket);
+        uint64_t rem_data = (object_start - index) + sizeof(serialized_type) + (arr1start - object_end) + (this->m_values.size() * sizeof(underlying_value_type)) + (arr2start - arr1end) + (this->m_buckets.size() * sizeof(Bucket));
         uint64_t written = rem_data;
         write(nullptr, object_start - index, rem_data);
         rem_data -= object_start - index;
-        write(reinterpret_cast<char*>(&buf[0]), sizeof(serialized_type), rem_data);
+        write(reinterpret_cast<const char*>(buf.data()), sizeof(serialized_type), rem_data);
         rem_data -= sizeof(serialized_type);
         write(nullptr, arr1start - object_end, rem_data);
         rem_data -= arr1start - object_end;
         auto siz = this->m_values.size() * sizeof(underlying_value_type);
-        write(reinterpret_cast<char*>(this->m_values.data()), siz, rem_data);
+        write(reinterpret_cast<const char*>(this->m_values.data()), siz, rem_data);
         rem_data -= siz;
         write(nullptr, arr2start - arr1end, rem_data);
         rem_data -= arr2start - arr1end;
         siz = this->m_buckets.size() * sizeof(Bucket);
-        write(reinterpret_cast<char*>(this->m_buckets.data()), siz, rem_data);
+        write(reinterpret_cast<const char*>(this->m_buckets.data()), siz, rem_data);
         rem_data -= siz;
         return written;    
     }
