@@ -925,9 +925,8 @@ private:
             explicit offset_ptr(int64_t offset)
                 : m_offset{offset}
             {}
-            auto get() -> Data* { 
-                return reinterpret_cast<Data*>(reinterpret_cast<char*>(this) + m_offset);
-            }
+            auto get() -> Data* { return reinterpret_cast<Data*>(reinterpret_cast<char*>(this) + m_offset); }
+            auto get() const -> const Data* { return reinterpret_cast<const Data*>(reinterpret_cast<const char*>(this) + m_offset); }
         };
         offset_ptr m_ptr;
         uint64_t m_size;
@@ -951,6 +950,8 @@ private:
 
         auto begin() -> iterator { return m_ptr.get(); }
         auto end() -> iterator { return m_ptr.get() + m_size; }
+        auto begin() const -> const_iterator { return m_ptr.get(); }
+        auto end() const -> const_iterator { return m_ptr.get() + m_size; }
         auto operator[](uint64_t index) -> Data& { return *(begin() + index); }
         [[nodiscard]] auto empty() const -> bool { return size() == 0; }
         [[nodiscard]] auto size() const -> uint64_t { return m_size; }
@@ -1447,6 +1448,11 @@ public:
         return this->m_equal;
     }
 
+    auto access_hash_unsafe(int64_t& offset) -> Hash& {
+        offset = offsetof(serialized_type, m_hash);
+        return this->m_hash;
+    }
+
     auto dump(std::invocable<const void*, uint64_t, uint64_t> auto write, int64_t index) const -> std::pair<uint64_t, uint64_t> {
         static_assert(!IsSegmented, "segmented layouts cannot be serialized");
         alignas(alignof(serialized_type)) std::array<std::byte, sizeof(serialized_type)> buf;
@@ -1481,6 +1487,38 @@ public:
         write(this->m_buckets.data(), siz, rem_data);
         rem_data -= siz;
         return {object_start, written};    
+    }
+
+    template <typename... Args>
+    auto emplace_with_hash(uint64_t hash, Args&&... args) -> std::pair<iterator, bool> {
+        // we have to instantiate the value_type to be able to access the key.
+        // 1. emplace_back the object so it is constructed. 2. If the key is already there, pop it later in the loop.
+        auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)...));
+        auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
+        auto bucket_idx = bucket_idx_from_hash(hash);
+
+        while (dist_and_fingerprint <= at(m_buckets, bucket_idx).m_dist_and_fingerprint) {
+            if (dist_and_fingerprint == at(m_buckets, bucket_idx).m_dist_and_fingerprint &&
+                m_equal(key, get_key(m_values[at(m_buckets, bucket_idx).m_value_idx]))) {
+                m_values.pop_back(); // value was already there, so get rid of it
+                return {begin() + static_cast<difference_type>(at(m_buckets, bucket_idx).m_value_idx), false};
+            }
+            dist_and_fingerprint = dist_inc(dist_and_fingerprint);
+            bucket_idx = next(bucket_idx);
+        }
+
+        // value is new, place the bucket and shift up until we find an empty spot
+        auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
+        if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full()))
+            ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
+                // increase_size just rehashes all the data we have in m_values
+                increase_size();
+            }
+        else {
+            // place element and shift up until we find an empty spot
+            place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
+        }
+        return {begin() + static_cast<difference_type>(value_idx), true};
     }
 
     auto operator=(table const& other) -> table& {
