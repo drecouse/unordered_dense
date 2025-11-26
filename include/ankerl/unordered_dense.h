@@ -474,6 +474,9 @@ template <typename T>
 using detect_is_transparent = typename T::is_transparent;
 
 template <typename T>
+using detect_serialized_t = typename T::serialized_t;
+
+template <typename T>
 using detect_iterator = typename T::iterator;
 
 template <typename T>
@@ -483,6 +486,9 @@ using detect_reserve = decltype(std::declval<T&>().reserve(std::size_t{}));
 
 template <typename Mapped>
 constexpr bool is_map_v = !std::is_void_v<Mapped>;
+
+template <typename T>
+constexpr bool has_serialized_v = is_detected_v<detect_serialized_t, T>;
 
 // clang-format off
 template <typename Hash, typename KeyEqual>
@@ -978,11 +984,11 @@ public:
     using iterator = std::conditional_t<is_map_v<T>, typename value_container_type::iterator, const_iterator>;
     using bucket_type = Bucket;
     using serialized_type = std::conditional_t<IsSegmented, void, table<
-        Key,
+        std::conditional_t<has_serialized_v<Key>, typename Key::serialized_t, Key>,
         T,
         Hash,
         KeyEqual,
-        offset_span<underlying_value_type>,
+        offset_span<typename underlying_value_type::serialized_t>,
         Bucket, 
         offset_span<Bucket>,
         false
@@ -1456,16 +1462,18 @@ public:
     auto dump(std::invocable<const void*, uint64_t, uint64_t> auto write, int64_t index) const -> std::pair<uint64_t, uint64_t> {
         static_assert(!IsSegmented, "segmented layouts cannot be serialized");
         alignas(alignof(serialized_type)) std::array<std::byte, sizeof(serialized_type)> buf;
+        std::vector<typename underlying_value_type::serialized_t> data{m_values.begin(), m_values.end()};
         auto* ptr = reinterpret_cast<serialized_type*>(&buf);
         ptr->m_shifts = this->m_shifts;
         ptr->m_equal = this->m_equal;
         ptr->m_hash = this->m_hash;
         ptr->m_max_load_factor = this->m_max_load_factor;
+        ptr->m_max_bucket_capacity = this->m_max_bucket_capacity;
         auto object_start = align_up(index, alignof(serialized_type) - 1);
         auto object_end = object_start + (int64_t)sizeof(serialized_type);
-        auto arr1start = align_up(object_end, alignof(underlying_value_type) - 1);
-        ptr->m_values = offset_span<underlying_value_type>{arr1start - (object_start + (int64_t)offsetof(serialized_type, m_values)), this->m_values.size()};
-        auto arr1end = arr1start + (sizeof(underlying_value_type) * this->m_values.size());
+        auto arr1start = align_up(object_end, alignof(typename underlying_value_type::serialized_t) - 1);
+        ptr->m_values = offset_span<typename underlying_value_type::serialized_t>{arr1start - (object_start + (int64_t)offsetof(serialized_type, m_values)), this->m_values.size()};
+        auto arr1end = arr1start + (sizeof(typename underlying_value_type::serialized_t) * this->m_values.size());
         auto arr2start = align_up(arr1end, alignof(Bucket) - 1);
         ptr->m_buckets = offset_span<Bucket>{arr2start - (object_start + (int64_t)offsetof(serialized_type, m_buckets)),
                                              this->m_buckets.size()};
@@ -1478,8 +1486,8 @@ public:
         rem_data -= sizeof(serialized_type);
         write(nullptr, arr1start - object_end, rem_data);
         rem_data -= arr1start - object_end;
-        auto siz = this->m_values.size() * sizeof(underlying_value_type);
-        write(this->m_values.data(), siz, rem_data);
+        auto siz = data.size() * sizeof(typename underlying_value_type::serialized_t);
+        write(data.data(), siz, rem_data);
         rem_data -= siz;
         write(nullptr, arr2start - arr1end, rem_data);
         rem_data -= arr2start - arr1end;
@@ -1493,7 +1501,7 @@ public:
     auto emplace_with_hash(uint64_t hash, Args&&... args) -> std::pair<iterator, bool> {
         // we have to instantiate the value_type to be able to access the key.
         // 1. emplace_back the object so it is constructed. 2. If the key is already there, pop it later in the loop.
-        auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)...));
+        auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)..., hash));
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
 
